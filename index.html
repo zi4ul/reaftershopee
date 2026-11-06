@@ -1,12 +1,58 @@
 <!DOCTYPE html>
-<html>
+<html lang="id">
 <head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Reafter</title>
+
+  <!-- Ikon & Add to Home Screen -->
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#1f50ea">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Reafter">
+
+  <style>
+    :root { --blue:#1f50ea; }
+    html,body { height:100%; margin:0; }
+    body {
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      gap:16px; padding:24px; box-sizing:border-box; text-align:center;
+      font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+      background:#fff; color:#1b1b1f;
+    }
+    img { width:96px; height:96px; border-radius:22px; }
+    h1 { margin:0; font-size:1.4rem; }
+    p { margin:0; max-width:320px; color:#555; line-height:1.5; font-size:.95rem; }
+    a.btn {
+      background:var(--blue); color:#fff; text-decoration:none; font-weight:600;
+      padding:12px 24px; border-radius:12px;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background:#111; color:#f2f2f2; } p { color:#aaa; }
+    }
+  </style>
+
   <script>
-    window.location.replace("https://shopee.co.id/universal-link/reafter.wear");
+    var SHOPEE = "https://shopee.co.id/universal-link/reafter.wear";
+
+    // Redirect hanya saat dibuka dari ikon Home Screen (mode standalone).
+    // Jika dibuka lewat browser, halaman ini tetap tampil agar bisa di-"Add to Home Screen".
+    var isStandalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      window.navigator.standalone === true;
+
+    if (isStandalone) {
+      window.location.replace(SHOPEE);
+    }
   </script>
 </head>
 <body>
+  <img src="icon-192.png" alt="Reafter">
+  <h1>Reafter</h1>
+  <p>Tambahkan ke layar utama lewat menu browser (⋮ atau tombol Bagikan), lalu buka dari ikon untuk langsung ke toko.</p>
+  <a class="btn" id="open" href="https://shopee.co.id/universal-link/reafter.wear">Buka di Shopee</a>
 </body>
 </html>
-
