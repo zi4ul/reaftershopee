@@ -265,7 +265,7 @@
 
   // ---------- T40: pustaka video ----------
   // Thumbnail dibuat di HP saat video dipilih (Drive tak bisa memberi gambar tanpa login), disimpan di penyimpanan browser per id Drive.
-  var KEY_VMETA = 'posthub.vmeta', MAX_VMETA = 60, MAX_THUMB = 20000;
+  var KEY_VMETA = 'posthub.vmeta', MAX_VMETA = 60, MAX_THUMB = 32000;   // v1.16.4: naik dari 20000 (thumbnail lebih tajam)
   function loadVideoMeta(storage) {
     try { var o = JSON.parse(storage.getItem(KEY_VMETA) || '{}'); return o && typeof o === 'object' && !Array.isArray(o) ? o : {}; } catch (e) { return {}; }
   }
@@ -274,11 +274,40 @@
     id = String(id || ''); if (!id || !meta || typeof meta !== 'object') return false;
     var all = loadVideoMeta(storage);
     var thumb = typeof meta.thumb === 'string' && /^data:image\/jpeg;base64,/.test(meta.thumb) && meta.thumb.length <= MAX_THUMB ? meta.thumb : '';
+    var prev = all[id] || {};
     all[id] = { t: Number(nowMs) || Date.now(), thumb: thumb, width: Number(meta.width) || 0, height: Number(meta.height) || 0, durationSec: Number(meta.durationSec) || 0 };
+    var alias = meta.alias !== undefined ? cleanAlias(meta.alias) : (prev.alias || '');   // nama alternatif hanya tampilan; nama asli di Drive tidak diubah
+    if (alias) all[id].alias = alias;
     var ids = Object.keys(all).sort(function (a, b) { return all[b].t - all[a].t; });
     ids.slice(MAX_VMETA).forEach(function (k) { delete all[k]; });
-    try { storage.setItem(KEY_VMETA, JSON.stringify(all)); return true; } catch (e) { return false; }
+    for (var attempt = 0; attempt < 3; attempt++) {   // v1.16.4: penyimpanan penuh → buang meta tertua separuh lalu coba lagi (dulu gagal diam-diam)
+      try { storage.setItem(KEY_VMETA, JSON.stringify(all)); return true; } catch (e) {
+        var keep = Object.keys(all).sort(function (a, b) { return all[b].t - all[a].t; });
+        if (keep.length <= 1) return false;
+        keep.slice(Math.ceil(keep.length / 2)).forEach(function (k) { if (k !== id) delete all[k]; });
+      }
+    }
+    return false;
   }
+  function cleanAlias(s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, 80); }
+  // simpan/hapus nama alternatif satu video (alias kosong = kembali ke nama asli). Data lain di meta dipertahankan.
+  function setVideoAlias(storage, id, alias) {
+    id = String(id || ''); if (!id) return false;
+    var all = loadVideoMeta(storage), e = all[id] || { t: Date.now(), thumb: '', width: 0, height: 0, durationSec: 0 }, al = cleanAlias(alias);
+    if (al) e.alias = al; else delete e.alias;
+    all[id] = e;
+    try { storage.setItem(KEY_VMETA, JSON.stringify(all)); return true; } catch (err) { return false; }
+  }
+  // potong nama panjang di TENGAH, ekstensi tetap terlihat: "IMG_2026_pro…_final.mp4"
+  function shortName(name, max) {
+    name = String(name == null ? '' : name); max = max > 8 ? max : 28;
+    if (name.length <= max) return name;
+    var dot = name.lastIndexOf('.'), ext = dot > 0 && name.length - dot <= 6 ? name.slice(dot) : '', base = ext ? name.slice(0, dot) : name;
+    var keep = max - ext.length - 1, head = Math.ceil(keep * 0.6), tail = keep - head;
+    return base.slice(0, head) + '…' + (tail > 0 ? base.slice(-tail) : '') + ext;
+  }
+  // nama yang ditampilkan: alias bila ada, kalau tidak nama asli
+  function displayName(v) { return (v && (v.alias || v.name)) || ''; }
   // driveVideos: hasil hub video.list; meta: hasil loadVideoMeta. Data HP menang atas Drive bila lebih lengkap.
   function mergeLibrary(driveVideos, meta) {
     meta = meta || {};
@@ -286,7 +315,7 @@
       var m = meta[v.id] || {};
       return { id: String(v.id), name: String(v.name || ''), size: Number(v.size) || 0, mime: v.mime || 'video/mp4', createdAt: v.createdAt || '',
                width: Number(m.width) || Number(v.width) || 0, height: Number(m.height) || Number(v.height) || 0,
-               durationSec: Number(m.durationSec) || Number(v.durationSec) || 0, thumb: m.thumb || '' };
+               durationSec: Number(m.durationSec) || Number(v.durationSec) || 0, thumb: m.thumb || '', alias: m.alias || '' };
     });
   }
   function describeVideo(v) {
@@ -298,8 +327,53 @@
     return parts.join(' · ');
   }
   var VIDEO_ERRORS = { video_in_use: 'Video masih dipakai job yang belum selesai.', not_in_library: 'Berkas ini bukan bagian pustaka video.', file_not_found: 'Video sudah tidak ada di Drive.',
-    trash_failed: 'Drive gagal membuang video, coba lagi.', drive_list_failed: 'Hub gagal membaca Drive.', unknown_action: 'Hub belum diperbarui (tempel ulang Api.gs + Upload.gs lalu Deploy versi baru).' };
+    trash_failed: 'Drive gagal membuang video, coba lagi.', file_trashed: 'Video ini sudah dihapus dari Drive.', too_large: 'Video terlalu besar untuk diputar di HP (maks 120 MB).', bad_index: 'Potongan video tidak valid.', drive_read_failed: 'Hub gagal membaca video dari Drive.', chunk_size_mismatch: 'Potongan video dari Drive tidak lengkap.', drive_list_failed: 'Hub gagal membaca Drive.', unknown_action: 'Hub belum diperbarui (tempel ulang Api.gs + Upload.gs lalu Deploy versi baru).' };
   function videoErrorText(code) { return VIDEO_ERRORS[code] || ('ditolak hub: ' + code); }
+
+
+  // ---------- v1.17.0: putar video dari Drive + thumbnail dari hub ----------
+  var MAX_PLAY_BYTES = 120 * 1024 * 1024;   // sama dengan MAX_PLAY_BYTES di hub/Upload.gs
+  function b64ToBytes(b64) {
+    var bin = atob(String(b64 || '')), n = bin.length, u = new Uint8Array(n);
+    for (var i = 0; i < n; i++) u[i] = bin.charCodeAt(i);
+    return u;
+  }
+  // deps: {hub(action, body)→Promise<json>, onProgress?(pct 0..100), isCancelled?()→bool}. Unduh potongan 3 MB satu per satu (tiap potongan dicoba ulang sekali), lalu susun jadi Blob.
+  async function downloadVideoBlob(deps, fileId) {
+    var parts = [], chunks = 1, size = 0, got = 0, mime = 'video/mp4';
+    if (!/^[\w-]{10,}$/.test(String(fileId || ''))) return { ok: false, error: 'bad_file_id', message: 'Video ini tidak ada di Drive.' };
+    for (var i = 0; i < chunks; i++) {
+      if (deps.isCancelled && deps.isCancelled()) return { ok: false, cancelled: true };
+      var r = null, lastErr = null;
+      for (var tryNo = 0; tryNo < 2 && !(r && r.ok); tryNo++) {
+        try { r = await deps.hub('video.read', { fileId: fileId, index: i }); lastErr = null; if (r && !r.ok && r.error !== 'busy') break; }
+        catch (e) { lastErr = e; r = null; }
+      }
+      if (deps.isCancelled && deps.isCancelled()) return { ok: false, cancelled: true };
+      if (lastErr) return { ok: false, error: 'network', message: 'Gagal mengunduh video: ' + lastErr.message };
+      if (!r || !r.ok) return { ok: false, error: (r && r.error) || 'unknown', message: videoErrorText(r && r.error) };
+      chunks = Number(r.chunks) || 1; size = Number(r.size) || size; mime = r.mime || mime;
+      if (size > MAX_PLAY_BYTES) return { ok: false, error: 'too_large', message: videoErrorText('too_large') };
+      var bytes; try { bytes = b64ToBytes(r.b64); } catch (e2) { return { ok: false, error: 'bad_data', message: 'Data video rusak.' }; }
+      parts.push(bytes); got += bytes.length;
+      if (deps.onProgress) deps.onProgress(size > 0 ? Math.min(100, got * 100 / size) : 0, i + 1, chunks);
+    }
+    return { ok: true, blob: new Blob(parts, { type: mime }), size: got, mime: mime };
+  }
+  // simpan thumbnail dari hub ke meta HP tanpa menghapus data lain (durasi, ukuran, nama alternatif). true bila tersimpan.
+  function setVideoThumb(storage, id, thumb) {
+    id = String(id || '');
+    if (!id || typeof thumb !== 'string' || !/^data:image\/jpeg;base64,/.test(thumb) || thumb.length > MAX_THUMB) return false;
+    var prev = loadVideoMeta(storage)[id] || {};
+    return saveVideoMeta(storage, id, { thumb: thumb, width: prev.width, height: prev.height, durationSec: prev.durationSec, alias: prev.alias });
+  }
+  // ids (maks 6 per panggilan; sisanya diabaikan). Mengembalikan {thumbs:{id:dataURL}} atau {error}. Hub lama (belum diperbarui) → {error:'unknown_action'}.
+  async function fetchHubThumbs(hub, ids) {
+    var r;
+    try { r = await hub('video.thumb', { ids: ids.slice(0, 6) }); } catch (e) { return { thumbs: {}, error: 'network' }; }
+    if (!r || !r.ok) return { thumbs: {}, error: (r && r.error) || 'unknown' };
+    return { thumbs: r.thumbs && typeof r.thumbs === 'object' ? r.thumbs : {}, missing: Array.isArray(r.missing) ? r.missing : [] };
+  }
 
   // T64b: hashtag otomatis saat mengetik. SALINAN `typeInto` dari reafter-app/src/mu/hashtag.js (T62a); paritas dijaga tests/pwa-core.test.js.
   // Bertambah (ketik/tempel): tiap kata diberi '#', '##' dirapikan; berkurang (Backspace): tidak diubah supaya tidak macet.
@@ -321,6 +395,59 @@
     return { value: out, caret: Math.max(0, Math.min(c, out.length)) };
   }
 
-  return { typeInto: typeInto, loadVideoMeta: loadVideoMeta, saveVideoMeta: saveVideoMeta, mergeLibrary: mergeLibrary, describeVideo: describeVideo, videoErrorText: videoErrorText, pickProduct: pickProduct, submitFlow: submitFlow, statusInfo: statusInfo, formatJob: formatJob, RESUME_CHOICES: RESUME_CHOICES, buildJobPayload: buildJobPayload, parseTags: parseTags, buildCaption: buildCaption, captionLength: captionLength, validateForm: validateForm,
+  // ---------- v1.18.0: tema (Gelap / Terang / Ikuti sistem), tersimpan di HP ini ----------
+  var KEY_THEME = 'posthub.theme', THEMES = ['dark', 'light', 'system'];
+  function loadTheme(storage) {
+    try { var v = storage && storage.getItem(KEY_THEME); return THEMES.indexOf(v) >= 0 ? v : 'system'; } catch (e) { return 'system'; }
+  }
+  function saveTheme(storage, mode) {
+    if (THEMES.indexOf(mode) < 0) return false;
+    try { storage.setItem(KEY_THEME, mode); return true; } catch (e) { return false; }
+  }
+  // Pasang tema ke <html>: "dark"/"light" memaksa; "system" menghapus atribut (CSS mengikuti prefers-color-scheme).
+  // Warna bilah status dibaca dari token --bg (bukan ditulis ulang di JS) lalu dipasang ke <meta name="theme-color" id="themecolor">.
+  function applyTheme(root, mode, win) {
+    if (!root || !root.setAttribute) return mode;
+    if (mode === 'dark' || mode === 'light') root.setAttribute('data-theme', mode); else root.removeAttribute('data-theme');
+    try {
+      var d = root.ownerDocument, meta = d && d.getElementById && d.getElementById('themecolor');
+      var bg = win && win.getComputedStyle ? String(win.getComputedStyle(root).getPropertyValue('--bg') || '').trim() : '';
+      if (meta && bg) meta.setAttribute('content', bg);
+    } catch (e) {}
+    return mode;
+  }
+
+  // ---------- v1.20.0: penjadwalan (nilai tetap 'YYYY-MM-DDTHH:mm' waktu lokal, sama dengan datetime-local; format job tidak berubah) ----------
+  var HARI = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+  var BULAN = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+  function p2(n) { return (n < 10 ? '0' : '') + n; }
+  function toLocalValue(d) { return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + 'T' + p2(d.getHours()) + ':' + p2(d.getMinutes()); }
+  // nilai bawaan saat "Jadwalkan" dipilih: kelipatan 30 menit berikutnya, minimal 30 menit dari sekarang
+  function defaultSchedule(nowMs) {
+    var t = new Date(nowMs + 30 * 60000), step = 30 * 60000;
+    t.setSeconds(0, 0);
+    return toLocalValue(new Date(Math.ceil(t.getTime() / step) * step));
+  }
+  // batas bawah untuk atribut min picker (menit sekarang)
+  function minSchedule(nowMs) { var d = new Date(nowMs); d.setSeconds(0, 0); return toLocalValue(d); }
+  // '' = valid; selain itu pesan untuk pengguna. Waktu yang sama dengan menit sekarang atau lebih lampau ditolak.
+  function scheduleProblem(value, nowMs) {
+    var t = Date.parse(value);
+    if (!value || Number.isNaN(t)) return 'Isi tanggal dan jam jadwal.';
+    var cut = new Date(nowMs); cut.setSeconds(0, 0);
+    if (t <= cut.getTime()) return 'Waktu jadwal sudah lewat. Pilih waktu yang akan datang.';
+    return '';
+  }
+  // tampilan ramah: { date: 'Sabtu, 14 Nov 2026', time: '15.30', rel: 'Hari ini' | 'Besok' | '' }
+  function formatSchedule(value, nowMs) {
+    var t = Date.parse(value);
+    if (!value || Number.isNaN(t)) return null;
+    var d = new Date(t), n = new Date(nowMs);
+    var day0 = function (x) { return new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime(); };
+    var diff = Math.round((day0(d) - day0(n)) / 86400000);
+    return { date: HARI[d.getDay()] + ', ' + d.getDate() + ' ' + BULAN[d.getMonth()] + ' ' + d.getFullYear(), time: p2(d.getHours()) + '.' + p2(d.getMinutes()), rel: diff === 0 ? 'Hari ini' : (diff === 1 ? 'Besok' : '') };
+  }
+
+  return { KEY_THEME: KEY_THEME, THEMES: THEMES, loadTheme: loadTheme, saveTheme: saveTheme, applyTheme: applyTheme, MAX_THUMB: MAX_THUMB, MAX_PLAY_BYTES: MAX_PLAY_BYTES, downloadVideoBlob: downloadVideoBlob, setVideoThumb: setVideoThumb, fetchHubThumbs: fetchHubThumbs, b64ToBytes: b64ToBytes, typeInto: typeInto, loadVideoMeta: loadVideoMeta, saveVideoMeta: saveVideoMeta, mergeLibrary: mergeLibrary, describeVideo: describeVideo, setVideoAlias: setVideoAlias, shortName: shortName, displayName: displayName, videoErrorText: videoErrorText, pickProduct: pickProduct, submitFlow: submitFlow, statusInfo: statusInfo, formatJob: formatJob, RESUME_CHOICES: RESUME_CHOICES, buildJobPayload: buildJobPayload, parseTags: parseTags, buildCaption: buildCaption, captionLength: captionLength, validateForm: validateForm, defaultSchedule: defaultSchedule, minSchedule: minSchedule, scheduleProblem: scheduleProblem, formatSchedule: formatSchedule,
     CAPTION_LIMIT: CAPTION_LIMIT, MAX_PRODUCTS: MAX_PRODUCTS, loadSettings: loadSettings, saveSettings: saveSettings, hubCall: hubCall, KEY_HUB: KEY_HUB, KEY_TOK: KEY_TOK };
 });

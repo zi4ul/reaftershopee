@@ -1,5 +1,5 @@
 // Service worker Post Hub: cache KERANGKA saja (HTML/JS/ikon). Panggilan hub & Drive TIDAK pernah di-cache.
-var CACHE = 'post-hub-shell-v6';   // naikkan angka ini setiap kali berkas kerangka berubah
+var CACHE = 'post-hub-shell-v23';   // naikkan angka ini setiap kali berkas kerangka berubah
 var SHELL = ['./', 'index.html', 'core.js', 'upload.js', 'app.js', 'manifest.json', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', function (e) {
