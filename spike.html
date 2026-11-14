@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<title>Post Hub — Spike 1A</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#111; --mut:#666; --line:#d8d8de; --acc:#0a6cff; --ok:#0a8a3a; --bad:#c62828; --card:#f5f5f8; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111214; --fg:#eee; --mut:#9a9aa3; --line:#2c2d33; --acc:#4c9aff; --ok:#3ecf74; --bad:#ff6b6b; --card:#1a1b1f; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); background:var(--bg); color:var(--fg);
+         font:16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width:640px; margin-inline:auto; }
+  h1 { font-size:20px; margin:0 0 4px; } .mut { color:var(--mut); font-size:14px; }
+  label { display:block; margin:12px 0 4px; font-weight:600; font-size:14px; }
+  input[type=text], input[type=password], input[type=url] { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); font-size:16px; }
+  input[type=file] { width:100%; padding:10px 0; font-size:16px; }
+  button { padding:11px 14px; border:0; border-radius:8px; background:var(--acc); color:#fff; font-size:16px; font-weight:600; margin:8px 8px 0 0; }
+  button.sec { background:var(--card); color:var(--fg); border:1px solid var(--line); }
+  button:disabled { opacity:.5; }
+  .box { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; margin-top:14px; }
+  progress { width:100%; height:18px; } .row { display:flex; justify-content:space-between; font-size:14px; color:var(--mut); }
+  pre { white-space:pre-wrap; word-break:break-word; font:12px/1.4 ui-monospace, Menlo, monospace; margin:0; max-height:300px; overflow:auto; }
+  .ok { color:var(--ok); font-weight:700; } .bad { color:var(--bad); font-weight:700; }
+</style>
+</head>
+<body>
+<h1>Post Hub — Spike 1A</h1>
+<div class="mut">Uji unggah video besar ke Drive. Biarkan layar menyala dan tetap di halaman ini selama unggah.</div>
+
+<label for="hub">URL web app hub (Apps Script)</label>
+<input id="hub" type="url" placeholder="https://script.google.com/macros/s/…/exec" autocapitalize="off" autocorrect="off">
+<label for="tok">Token klien</label>
+<input id="tok" type="password" autocapitalize="off" autocorrect="off">
+<button id="save" class="sec">Simpan</button>
+<button id="ping" class="sec">Tes koneksi</button>
+
+<label for="file">Video</label>
+<input id="file" type="file" accept="video/*">
+<div id="info" class="mut"></div>
+<button id="go" disabled>Unggah ke Drive</button>
+
+<div class="box" id="prog" hidden>
+  <progress id="bar" max="100" value="0"></progress>
+  <div class="row"><span id="pct">0%</span><span id="spd"></span><span id="eta"></span></div>
+</div>
+
+<div class="box"><div id="result" class="mut">Belum ada hasil.</div></div>
+
+<div class="box">
+  <div class="row"><strong>Log</strong><span><a href="#" id="copy">Salin log</a></span></div>
+  <pre id="log"></pre>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var CHUNK = 4 * 1024 * 1024;           // kelipatan 256 KiB
+  var MAX_RETRY = 6;
+  var $ = function (id) { return document.getElementById(id); };
+  var logLines = [];
+  var uploading = false;
+  var wakeLock = null;
+  var fileObj = null;
+
+  function ts() { return new Date().toTimeString().slice(0, 8); }
+  function log(msg) { logLines.push(ts() + ' ' + msg); $('log').textContent = logLines.join('\n'); $('log').scrollTop = 1e9; }
+  function mb(n) { return (n / 1048576).toFixed(1) + ' MB'; }
+  function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { log('localStorage tidak tersedia: ' + e); } }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  $('hub').value = lsGet('ph_hub');
+  $('tok').value = lsGet('ph_tok');
+  $('save').onclick = function () { lsSet('ph_hub', $('hub').value.trim()); lsSet('ph_tok', $('tok').value.trim()); log('Pengaturan disimpan.'); };
+
+  // ---------- panggilan ke hub (text/plain → tanpa preflight) ----------
+  function hub(action, extra) {
+    var url = $('hub').value.trim(), token = $('tok').value.trim();
+    if (!url || !token) return Promise.reject(new Error('Isi URL hub dan token dulu.'));
+    var body = JSON.stringify(Object.assign({ token: token, action: action }, extra || {}));
+    return fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body, redirect: 'follow' })
+      .then(function (r) { return r.text(); })
+      .then(function (t) { try { return JSON.parse(t); } catch (e) { throw new Error('Respons hub bukan JSON: ' + t.slice(0, 120)); } });
+  }
+
+  $('ping').onclick = function () {
+    log('ping …');
+    hub('ping').then(function (r) { log('ping → ' + JSON.stringify(r)); setResult(r.ok ? 'Koneksi hub OK (CORS text/plain berhasil).' : 'Hub menjawab tetapi menolak: ' + r.error, r.ok); })
+      .catch(function (e) { log('ping GAGAL: ' + e.message); setResult('Gagal menghubungi hub: ' + e.message + ' (kemungkinan CORS/URL/izin deploy)', false); });
+  };
+
+  function setResult(text, ok) {
+    var el = $('result'); el.textContent = text; el.className = ok === true ? 'ok' : ok === false ? 'bad' : 'mut';
+  }
+
+  // ---------- pilih berkas ----------
+  $('file').onchange = function () {
+    fileObj = this.files && this.files[0] || null;
+    $('go').disabled = !fileObj;
+    if (!fileObj) { $('info').textContent = ''; return; }
+    var warn = /\.mp4$/i.test(fileObj.name) ? '' : ' ⚠ bukan .mp4 (iPhone: pilih "Paling Kompatibel" agar jadi H.264/.mp4)';
+    $('info').textContent = fileObj.name + ' · ' + mb(fileObj.size) + ' · ' + (fileObj.type || 'tipe tidak diketahui') + warn;
+    probe(fileObj);
+  };
+
+  function probe(f) { // hanya info, tidak menghalangi unggah
+    try {
+      var v = document.createElement('video'), u = URL.createObjectURL(f), done = false;
+      var fin = function () { if (!done) { done = true; URL.revokeObjectURL(u); } };
+      v.preload = 'metadata'; v.muted = true;
+      v.onloadedmetadata = function () { log('Info video: ' + v.videoWidth + '×' + v.videoHeight + ', ' + v.duration.toFixed(1) + ' dtk'); fin(); };
+      v.onerror = function () { log('Info video: tidak terbaca di browser ini (mungkin HEVC/.mov).'); fin(); };
+      v.src = u; setTimeout(fin, 8000);
+    } catch (e) { /* abaikan */ }
+  }
+
+  // ---------- wake lock ----------
+  function lockScreen() {
+    if (!('wakeLock' in navigator)) { log('Wake Lock tidak didukung; jaga layar tetap menyala manual.'); return; }
+    navigator.wakeLock.request('screen').then(function (l) { wakeLock = l; log('Layar dijaga menyala (Wake Lock aktif).'); })
+      .catch(function (e) { log('Wake Lock gagal: ' + e.message); });
+  }
+  function unlockScreen() { if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; } }
+  document.addEventListener('visibilitychange', function () {
+    if (!uploading) return;
+    if (document.hidden) log('⚠ Halaman masuk latar belakang — unggahan bisa terhenti di iOS.');
+    else { log('Halaman kembali tampil.'); lockScreen(); }
+  });
+
+  // ---------- unggah per potongan ----------
+  function put(uri, blob, start, endIncl, total, onProg) {
+    return new Promise(function (resolve, reject) {
+      var x = new XMLHttpRequest();
+      x.open('PUT', uri);
+      x.setRequestHeader('Content-Range', blob ? ('bytes ' + start + '-' + endIncl + '/' + total) : ('bytes */' + total));
+      x.upload.onprogress = function (e) { if (onProg && e.lengthComputable) onProg(e.loaded); };
+      x.onload = function () { resolve({ status: x.status, range: x.getResponseHeader('Range'), text: x.responseText }); };
+      x.onerror = function () { reject(new Error('jaringan/CORS gagal')); };
+      x.ontimeout = function () { reject(new Error('timeout')); };
+      x.timeout = 120000;
+      x.send(blob || null);
+    });
+  }
+  function nextFromRange(range, fallback) { // "bytes=0-12345" → 12346
+    var m = /bytes=0-(\d+)/.exec(range || '');
+    return m ? Number(m[1]) + 1 : fallback;
+  }
+
+  async function upload(f, session) {
+    var total = f.size, offset = 0, t0 = Date.now(), fileId = session.fileId, fails = 0;
+    $('prog').hidden = false;
+    function show(sent) {
+      var p = Math.min(100, sent / total * 100), sec = (Date.now() - t0) / 1000, spd = sent / 1048576 / Math.max(sec, 0.5);
+      $('bar').value = p; $('pct').textContent = p.toFixed(1) + '% (' + mb(sent) + ' / ' + mb(total) + ')';
+      $('spd').textContent = spd.toFixed(2) + ' MB/dtk';
+      $('eta').textContent = spd > 0 ? Math.max(0, Math.round((total - sent) / 1048576 / spd)) + ' dtk lagi' : '';
+    }
+    async function resync() { // tanya Drive sudah menerima sampai mana
+      try {
+        var r = await put(session.sessionUri, null, 0, 0, total);
+        if (r.status === 308) { offset = nextFromRange(r.range, 0); log('resume dari ' + mb(offset)); }
+        else if (r.status === 200 || r.status === 201) { offset = total; log('Drive sudah menerima seluruh berkas.'); }
+      } catch (e) { log('cek status gagal: ' + e.message); }
+    }
+    while (true) {
+      if (offset >= total) {
+        if (fileId) return fileId;
+        throw new Error('selesai tetapi fileId tidak diketahui');
+      }
+      var end = Math.min(offset + CHUNK, total) - 1, base = offset;
+      try {
+        var r = await put(session.sessionUri, f.slice(offset, end + 1), offset, end, total, function (loaded) { show(base + loaded); });
+        if (r.status === 308) { fails = 0; offset = nextFromRange(r.range, end + 1); log('potongan OK → ' + mb(offset)); show(offset); continue; }
+        if (r.status === 200 || r.status === 201) {
+          try { var j = JSON.parse(r.text); if (j.id) fileId = j.id; } catch (e) {}
+          show(total); log('unggahan selesai (HTTP ' + r.status + ').');
+          if (!fileId) { var fe = new Error('selesai tetapi respons tidak memuat id berkas'); fe.fatal = true; throw fe; }
+          return fileId;
+        }
+        throw new Error('HTTP ' + r.status + ' ' + (r.text || '').slice(0, 150));
+      } catch (e) {
+        if (e.fatal) throw e;
+        fails++; log('✗ potongan gagal (' + fails + '/' + MAX_RETRY + '): ' + e.message);
+        if (fails > MAX_RETRY) throw e;
+        await sleep(Math.min(30000, 1000 * Math.pow(2, fails)));
+        await resync();
+      }
+    }
+  }
+
+  $('go').onclick = function () {
+    if (!fileObj || uploading) return;
+    var f = fileObj, mime = f.type || (/\.mov$/i.test(f.name) ? 'video/quicktime' : 'video/mp4');
+    uploading = true; $('go').disabled = true; setResult('Mengunggah …', null); lockScreen();
+    log('init sesi: ' + f.name + ' (' + f.size + ' byte, ' + mime + '), origin=' + location.origin);
+    var t0 = Date.now();
+    hub('upload.init', { name: f.name, size: f.size, mime: mime, origin: location.origin })
+      .then(function (s) {
+        if (!s.ok) throw new Error('upload.init ditolak: ' + s.error + (s.detail ? ' — ' + s.detail : '') + (s.status ? ' (HTTP ' + s.status + ')' : ''));
+        log('sessionUri diterima. fileId awal: ' + (s.fileId || '(belum ada)'));
+        return upload(f, s);
+      })
+      .then(function (fileId) {
+        log('verifikasi ukuran di Drive …');
+        return hub('upload.finish', { fileId: fileId, size: f.size }).then(function (v) {
+          log('upload.finish → ' + JSON.stringify(v));
+          var secs = ((Date.now() - t0) / 1000).toFixed(0);
+          if (v.ok && v.match) setResult('BERHASIL ✓ ' + mb(f.size) + ' utuh di Drive dalam ' + secs + ' dtk. Buka Drive → folder post-hub-spike, putar videonya, lalu laporkan hasilnya.', true);
+          else setResult('Terunggah tetapi ukuran TIDAK cocok atau verifikasi gagal: ' + JSON.stringify(v), false);
+        });
+      })
+      .catch(function (e) {
+        log('GAGAL: ' + e.message);
+        var hint = /CORS|jaringan/i.test(e.message) ? ' → kemungkinan CORS/308 bermasalah: catat log ini, pakai cadangan 6.1.' : '';
+        setResult('GAGAL: ' + e.message + hint, false);
+      })
+      .then(function () { uploading = false; $('go').disabled = !fileObj; unlockScreen(); });
+  };
+
+  $('copy').onclick = function (e) {
+    e.preventDefault();
+    var t = logLines.join('\n');
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(function () { log('Log disalin.'); }, function () { log('Gagal menyalin.'); });
+    else { var r = document.createRange(); r.selectNodeContents($('log')); var s = getSelection(); s.removeAllRanges(); s.addRange(r); log('Teks log dipilih; salin manual.'); }
+  };
+
+  log('Siap. Isi URL hub + token → Simpan → Tes koneksi → pilih video → Unggah.');
+})();
+</script>
+</body>
+</html>
